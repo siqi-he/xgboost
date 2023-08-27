@@ -80,7 +80,7 @@ class HistEvaluator {
 
     auto f_hist = hist.subspan(cut_ptr[fidx], n_bins);
     auto feature_sum = GradStats{
-        std::accumulate(f_hist.data(), f_hist.data() + f_hist.size(), GradientPairPrecise{})};
+        std::accumulate(f_hist.data(), f_hist.data() + f_hist.size(), GradientPair{})};
     GradStats missing;
     auto const &parent = snode_[nidx];
     missing.SetSubstract(parent.stats, feature_sum);

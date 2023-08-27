@@ -77,7 +77,7 @@ CPUExpandEntry QuantileHistMaker::Builder::InitRoot(
   }
 
   {
-    GradientPairPrecise grad_stat;
+    GradientPair grad_stat;
     if (p_fmat->IsDense()) {
       /**
        * Specialized code for dense data: For dense data (with no missing value), the sum
@@ -91,7 +91,7 @@ CPUExpandEntry QuantileHistMaker::Builder::InitRoot(
       auto hist = this->histogram_builder_->Histogram()[RegTree::kRoot];
       auto begin = hist.data();
       for (uint32_t i = ibegin; i < iend; ++i) {
-        GradientPairPrecise const &et = begin[i];
+        GradientPair const &et = begin[i];
         grad_stat.Add(et.GetGrad(), et.GetHess());
       }
     } else {

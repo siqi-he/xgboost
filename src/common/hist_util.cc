@@ -67,9 +67,9 @@ HistogramCuts SketchOnDMatrix(DMatrix *m, int32_t max_bins, int32_t n_threads, b
  */
 void InitilizeHistByZeroes(GHistRow hist, size_t begin, size_t end) {
 #if defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1
-  std::fill(hist.begin() + begin, hist.begin() + end, xgboost::GradientPairPrecise());
+  std::fill(hist.begin() + begin, hist.begin() + end, xgboost::GradientPair());
 #else  // defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1
-  memset(hist.data() + begin, '\0', (end - begin) * sizeof(xgboost::GradientPairPrecise));
+  memset(hist.data() + begin, '\0', (end - begin) * sizeof(xgboost::GradientPair));
 #endif  // defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1
 }
 
@@ -77,8 +77,8 @@ void InitilizeHistByZeroes(GHistRow hist, size_t begin, size_t end) {
  * \brief Increment hist as dst += add in range [begin, end)
  */
 void IncrementHist(GHistRow dst, const GHistRow add, size_t begin, size_t end) {
-  double* pdst = reinterpret_cast<double*>(dst.data());
-  const double *padd = reinterpret_cast<const double *>(add.data());
+  float* pdst = reinterpret_cast<float*>(dst.data());
+  const float *padd = reinterpret_cast<const float *>(add.data());
 
   for (size_t i = 2 * begin; i < 2 * end; ++i) {
     pdst[i] += padd[i];
@@ -89,8 +89,8 @@ void IncrementHist(GHistRow dst, const GHistRow add, size_t begin, size_t end) {
  * \brief Copy hist from src to dst in range [begin, end)
  */
 void CopyHist(GHistRow dst, const GHistRow src, size_t begin, size_t end) {
-  double *pdst = reinterpret_cast<double *>(dst.data());
-  const double *psrc = reinterpret_cast<const double *>(src.data());
+  float *pdst = reinterpret_cast<float *>(dst.data());
+  const float *psrc = reinterpret_cast<const float *>(src.data());
 
   for (size_t i = 2 * begin; i < 2 * end; ++i) {
     pdst[i] = psrc[i];
@@ -102,9 +102,10 @@ void CopyHist(GHistRow dst, const GHistRow src, size_t begin, size_t end) {
  */
 void SubtractionHist(GHistRow dst, const GHistRow src1, const GHistRow src2, size_t begin,
                      size_t end) {
-  double* pdst = reinterpret_cast<double*>(dst.data());
-  const double* psrc1 = reinterpret_cast<const double*>(src1.data());
-  const double* psrc2 = reinterpret_cast<const double*>(src2.data());
+  int pause = 1;
+  float* pdst = reinterpret_cast<float*>(dst.data());
+  const float* psrc1 = reinterpret_cast<const float*>(src1.data());
+  const float* psrc2 = reinterpret_cast<const float*>(src2.data());
 
   for (size_t i = 2 * begin; i < 2 * end; ++i) {
     pdst[i] = psrc1[i] - psrc2[i];
@@ -217,7 +218,7 @@ void RowsWiseBuildHistKernel(const std::vector<GradientPair> &gpair,
 
   const size_t n_features =
       get_row_ptr(row_indices.begin[0] + 1) - get_row_ptr(row_indices.begin[0]);
-  auto hist_data = reinterpret_cast<double *>(hist.data());
+  auto hist_data = reinterpret_cast<float *>(hist.data());
   const uint32_t two{2};  // Each element from 'gpair' and 'hist' contains
                           // 2 FP values: gradient and hessian.
                           // So we need to multiply each row-index/bin-index by 2

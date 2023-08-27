@@ -348,7 +348,7 @@ bst_bin_t XGBOOST_HOST_DEV_INLINE BinarySearchBin(size_t begin, size_t end,
   return -1;
 }
 
-using GHistRow = Span<xgboost::GradientPairPrecise>;
+using GHistRow = Span<xgboost::GradientPair>;
 
 /*!
  * \brief fill a histogram by zeros
@@ -381,11 +381,11 @@ class HistCollection {
     constexpr uint32_t kMax = std::numeric_limits<uint32_t>::max();
     const size_t id = row_ptr_.at(nid);
     CHECK_NE(id, kMax);
-    GradientPairPrecise* ptr = nullptr;
+    GradientPair* ptr = nullptr;
     if (contiguous_allocation_) {
-      ptr = const_cast<GradientPairPrecise*>(data_[0].data() + nbins_*id);
+      ptr = const_cast<GradientPair*>(data_[0].data() + nbins_*id);
     } else {
-      ptr = const_cast<GradientPairPrecise*>(data_[id].data());
+      ptr = const_cast<GradientPair*>(data_[id].data());
     }
     return {ptr, nbins_};
   }
@@ -445,7 +445,7 @@ class HistCollection {
   /*! \brief flag to identify contiguous memory allocation */
   bool contiguous_allocation_ = false;
 
-  std::vector<std::vector<GradientPairPrecise>> data_;
+  std::vector<std::vector<GradientPair>> data_;
 
   /*! \brief row_ptr_[nid] locates bin for histogram of node nid */
   std::vector<size_t> row_ptr_;
