@@ -500,16 +500,9 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
     const size_t hist_bytes = gmat.cut.Ptrs().back() * 2 * sizeof(double);
     if (tiled_threshold > 0 && hist_bytes > tiled_threshold) {
       constexpr double kMinDensityForTiling = 0.5;
-      double density = 1.0;
-      if constexpr (BuildingManager::kAnyMissing) {
-        const size_t n_features = gmat.cut.Ptrs().size() - 1;
-        const size_t total_rows = gmat.row_ptr.size() - 1;
-        double avg_nnz = static_cast<double>(gmat.row_ptr[total_rows]) / total_rows;
-        density = avg_nnz / static_cast<double>(n_features);
-      }
       // Sparse tiled path requires sorted bin indices for cursor traversal.
       bool bin_sorted = !BuildingManager::kAnyMissing || gmat.RowsSortedByBin();
-      if (density > kMinDensityForTiling && bin_sorted) {
+      if (gmat.Density() > kMinDensityForTiling && bin_sorted) {
         RowsWiseBuildHistKernelTiled<BuildingManager>(gpair, row_indices, gmat, hist);
         return;
       }
