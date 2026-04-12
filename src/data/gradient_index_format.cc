@@ -64,6 +64,17 @@ namespace xgboost::data {
   if (!page->ReadColumnPage(fi)) {
     return false;
   }
+
+  // rows_sorted_by_bin: appended after column page data.
+  // Legacy cache files won't have this field — fall back to false (safe:
+  // disables sparse tiled kernel, no correctness risk).
+  bool rows_sorted = false;
+  if (fi->Read(&rows_sorted)) {
+    page->SetRowsSortedByBin(rows_sorted);
+  } else {
+    page->SetRowsSortedByBin(false);
+  }
+
   return true;
 }
 
@@ -92,6 +103,10 @@ namespace xgboost::data {
   bytes += fo->Write(page.IsDense());
 
   bytes += page.WriteColumnPage(fo);
+
+  // Append rows_sorted_by_bin after column page data.
+  bytes += fo->Write(page.RowsSortedByBin());
+
   return bytes;
 }
 

@@ -137,6 +137,22 @@ class GHistIndexMatrix {
       // no compression
       SetIndexData(index_data_span, rbegin, ft, batch_threads, batch, is_valid, n_bins_total,
                    [](auto idx, auto) { return idx; });
+      // Check whether sparse bin indices are sorted (non-decreasing) per row.
+      // Required for cursor-based traversal in RowsWiseBuildHistKernelTiled.
+      // One compare per valid element, early-exit on first unsorted row.
+      std::atomic<bool> sorted{true};
+      common::ParallelFor(batch.Size(), batch_threads, [&](size_t i) {
+        if (!sorted.load(std::memory_order_relaxed)) return;
+        size_t ibegin = row_ptr[rbegin + i];
+        size_t iend = row_ptr[rbegin + i + 1];
+        for (size_t j = ibegin + 1; j < iend; ++j) {
+          if (index_data_span[j] < index_data_span[j - 1]) {
+            sorted.store(false, std::memory_order_relaxed);
+            return;
+          }
+        }
+      });
+      rows_sorted_by_bin_ = rows_sorted_by_bin_ && sorted.load();
     }
     this->GatherHitCount(n_threads, n_bins_total);
   }
@@ -247,6 +263,13 @@ class GHistIndexMatrix {
 
   [[nodiscard]] bool IsDense() const { return isDense_; }
   void SetDense(bool is_dense) { isDense_ = is_dense; }
+
+  /** @brief Whether per-row global bin indices are sorted (non-decreasing).
+   *  Dense data is always positionally ordered. For sparse data, this is
+   *  computed during index construction. The sparse tiled histogram kernel
+   *  requires this for cursor-based traversal. */
+  [[nodiscard]] bool RowsSortedByBin() const { return isDense_ || rows_sorted_by_bin_; }
+  void SetRowsSortedByBin(bool v) { rows_sorted_by_bin_ = v; }
   [[nodiscard]] bst_idx_t BaseRowId() const { return base_rowid; }
   /**
    * @brief Get the local row index from the global row index.
@@ -291,6 +314,7 @@ class GHistIndexMatrix {
   std::unique_ptr<common::ColumnMatrix> columns_;
   std::vector<size_t> hit_count_tloc_;
   bool isDense_;
+  bool rows_sorted_by_bin_{true};
 };
 
 /**

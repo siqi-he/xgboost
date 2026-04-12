@@ -507,7 +507,9 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
         double avg_nnz = static_cast<double>(gmat.row_ptr[total_rows]) / total_rows;
         density = avg_nnz / static_cast<double>(n_features);
       }
-      if (density > kMinDensityForTiling) {
+      // Sparse tiled path requires sorted bin indices for cursor traversal.
+      bool bin_sorted = !BuildingManager::kAnyMissing || gmat.RowsSortedByBin();
+      if (density > kMinDensityForTiling && bin_sorted) {
         RowsWiseBuildHistKernelTiled<BuildingManager>(gpair, row_indices, gmat, hist);
         return;
       }
