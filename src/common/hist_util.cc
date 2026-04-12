@@ -353,12 +353,166 @@ void ColsWiseBuildHistKernel(Span<GradientPair const> gpair, Span<bst_idx_t cons
   }
 }
 
+// Row-wise kernel with column-block tiling and local buffer.
+// Adds an outer column-block loop; each block accumulates into a small
+// local buffer that fits in L1/L2, then flushes to the full histogram.
+//
+// Dense path (kAnyMissing=false): position j = feature j, direct loop bounds.
+// Sparse path (kAnyMissing=true): per-row cursors advance through sorted
+//   global bin indices across column blocks. Total work = one pass per row.
+template <class BuildingManager>
+void RowsWiseBuildHistKernelTiled(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
+                                  const GHistIndexMatrix &gmat, GHistRow hist) {
+  constexpr bool kAnyMissing = BuildingManager::kAnyMissing;
+  constexpr bool kFirstPage = BuildingManager::kFirstPage;
+  using BinIdxType = typename BuildingManager::BinIdxType;
+
+  const size_t size = row_indices.size();
+  if (size == 0) return;
+  bst_idx_t const *rid = row_indices.data();
+  auto const *p_gpair = reinterpret_cast<const float *>(gpair.data());
+  const BinIdxType *gradient_index = gmat.index.data<BinIdxType>();
+
+  auto const &row_ptr = gmat.row_ptr.data();
+  auto base_rowid = gmat.base_rowid;
+  std::uint32_t const *offsets = gmat.index.Offset();
+  if (kAnyMissing) {
+    CHECK(!offsets);
+  } else {
+    CHECK(offsets);
+  }
+  auto get_row_ptr = [&](bst_idx_t ridx) {
+    return kFirstPage ? row_ptr[ridx] : row_ptr[ridx - base_rowid];
+  };
+  auto get_rid = [&](bst_idx_t ridx) {
+    return kFirstPage ? ridx : (ridx - base_rowid);
+  };
+
+  auto const &cut_ptrs = gmat.cut.Ptrs();
+  const size_t n_features = cut_ptrs.size() - 1;
+  auto hist_data = reinterpret_cast<double *>(hist.data());
+  const uint32_t two{2};
+
+  constexpr size_t kColBlockSize = 32;
+
+  // Compute max bins across all inner blocks (for buffer sizing)
+  size_t max_block_bins = 0;
+  for (size_t jj = 0; jj < n_features; jj += kColBlockSize) {
+    size_t jj_end = std::min(jj + kColBlockSize, n_features);
+    size_t bins = cut_ptrs[jj_end] - cut_ptrs[jj];
+    max_block_bins = std::max(max_block_bins, bins);
+  }
+
+  // Thread-local buffer reused across column blocks
+  static thread_local std::vector<double> tl_buf;
+  tl_buf.resize(max_block_bins * 2);
+
+  if constexpr (!kAnyMissing) {
+    // Dense path: position j = feature j
+    for (size_t cid_begin = 0; cid_begin < n_features; cid_begin += kColBlockSize) {
+      const size_t cid_end = std::min(cid_begin + kColBlockSize, n_features);
+      const size_t block_bin_start = cut_ptrs[cid_begin];
+      const size_t block_n_bins = cut_ptrs[cid_end] - block_bin_start;
+
+      double *local_hist = tl_buf.data();
+      std::fill_n(local_hist, block_n_bins * 2, 0.0);
+
+      for (size_t i = 0; i < size; ++i) {
+        const size_t idx_gh = two * rid[i];
+        const float pgh_t[] = {p_gpair[idx_gh], p_gpair[idx_gh + 1]};
+        const BinIdxType *gr_index_local = gradient_index + get_rid(rid[i]) * n_features;
+
+        for (size_t j = cid_begin; j < cid_end; ++j) {
+          const uint32_t global_bin = static_cast<uint32_t>(gr_index_local[j]) + offsets[j];
+          const uint32_t local_bin = two * (global_bin - static_cast<uint32_t>(block_bin_start));
+          *(local_hist + local_bin) += pgh_t[0];
+          *(local_hist + local_bin + 1) += pgh_t[1];
+        }
+      }
+
+      double *dst = hist_data + two * block_bin_start;
+      for (size_t j = 0; j < block_n_bins * 2; ++j) {
+        dst[j] += local_hist[j];
+      }
+    }
+  } else {
+    // Sparse path: per-row cursors through sorted global bin indices
+    std::vector<size_t> row_starts(size);
+    std::vector<size_t> row_sizes(size);
+    for (size_t i = 0; i < size; ++i) {
+      row_starts[i] = get_row_ptr(rid[i]);
+      row_sizes[i] = get_row_ptr(rid[i] + 1) - row_starts[i];
+    }
+
+    // Per-row cursors track position within each row's entries across column
+    // blocks. Since entries are sorted by global bin index and blocks are
+    // processed in ascending bin order, the cursor for block k+1 starts where
+    // block k left off. Total work across all blocks = one pass per row.
+    std::vector<uint32_t> cursors(size, 0);
+
+    for (size_t cid_begin = 0; cid_begin < n_features; cid_begin += kColBlockSize) {
+      const size_t cid_end = std::min(cid_begin + kColBlockSize, n_features);
+      const uint32_t bin_lo = cut_ptrs[cid_begin];
+      const uint32_t bin_hi = cut_ptrs[cid_end];
+      const size_t block_n_bins = bin_hi - bin_lo;
+
+      double *local_hist = tl_buf.data();
+      std::fill_n(local_hist, block_n_bins * 2, 0.0);
+
+      for (size_t i = 0; i < size; ++i) {
+        const BinIdxType *gr_row = gradient_index + row_starts[i];
+        const size_t row_size = row_sizes[i];
+
+        const size_t idx_gh = two * rid[i];
+        const float pgh_t[] = {p_gpair[idx_gh], p_gpair[idx_gh + 1]};
+
+        size_t j = cursors[i];
+        while (j < row_size && static_cast<uint32_t>(gr_row[j]) < bin_lo) ++j;
+        while (j < row_size && static_cast<uint32_t>(gr_row[j]) < bin_hi) {
+          const uint32_t gidx = static_cast<uint32_t>(gr_row[j]);
+          const uint32_t local_bin = two * (gidx - bin_lo);
+          *(local_hist + local_bin) += pgh_t[0];
+          *(local_hist + local_bin + 1) += pgh_t[1];
+          ++j;
+        }
+        cursors[i] = j;
+      }
+
+      double *dst = hist_data + two * bin_lo;
+      for (size_t j = 0; j < block_n_bins * 2; ++j) {
+        dst[j] += local_hist[j];
+      }
+    }
+  }
+}
+
 template <class BuildingManager>
 void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                       const GHistIndexMatrix &gmat, GHistRow hist) {
+                       const GHistIndexMatrix &gmat, GHistRow hist, std::size_t tiled_threshold) {
   if (BuildingManager::kReadByColumn) {
     ColsWiseBuildHistKernel<BuildingManager>(gpair, row_indices, gmat, hist);
   } else {
+    // Large histogram + sufficiently dense data: use tiled kernel.
+    // tiled_threshold is computed from cache sizes: 0.8 * (L2 + L3/nthreads).
+    // Tiling adds flush overhead per column block. For sparse data where
+    // few bins are hit per row, the flush cost dominates. Gate on density
+    // to avoid regression on highly sparse datasets.
+    const size_t hist_bytes = gmat.cut.Ptrs().back() * 2 * sizeof(double);
+    if (tiled_threshold > 0 && hist_bytes > tiled_threshold) {
+      constexpr double kMinDensityForTiling = 0.5;
+      double density = 1.0;
+      if constexpr (BuildingManager::kAnyMissing) {
+        const size_t n_features = gmat.cut.Ptrs().size() - 1;
+        const size_t total_rows = gmat.row_ptr.size() - 1;
+        double avg_nnz = static_cast<double>(gmat.row_ptr[total_rows]) / total_rows;
+        density = avg_nnz / static_cast<double>(n_features);
+      }
+      if (density > kMinDensityForTiling) {
+        RowsWiseBuildHistKernelTiled<BuildingManager>(gpair, row_indices, gmat, hist);
+        return;
+      }
+    }
+
     const size_t nrows = row_indices.size();
     const size_t no_prefetch_size = Prefetch::NoPrefetchSize(nrows);
     // if need to work with all rows from bin-matrix (e.g. root node)
@@ -387,20 +541,23 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
 
 template <bool any_missing>
 void BuildHist(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column) {
+               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
+               std::size_t tiled_threshold) {
   bool first_page = gmat.base_rowid == 0;
   auto bin_type_size = gmat.index.GetBinTypeSize();
 
   GHistBuildingManager<any_missing>::DispatchAndExecute(
       {first_page, read_by_column, bin_type_size}, [&](auto t) {
         using BuildingManager = decltype(t);
-        BuildHistDispatch<BuildingManager>(gpair, row_indices, gmat, hist);
+        BuildHistDispatch<BuildingManager>(gpair, row_indices, gmat, hist, tiled_threshold);
       });
 }
 
 template void BuildHist<true>(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                              const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column);
+                              const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
+                              std::size_t tiled_threshold);
 
 template void BuildHist<false>(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column);
+                               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
+                               std::size_t tiled_threshold);
 }  // namespace xgboost::common

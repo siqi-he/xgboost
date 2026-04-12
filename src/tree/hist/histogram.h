@@ -4,17 +4,17 @@
 #ifndef XGBOOST_TREE_HIST_HISTOGRAM_H_
 #define XGBOOST_TREE_HIST_HISTOGRAM_H_
 
-#include <algorithm>   // for max
-#include <cstddef>     // for size_t
-#include <cstdint>     // for int32_t
-#include <utility>     // for move
-#include <vector>      // for vector
+#include <algorithm>  // for max
+#include <cstddef>    // for size_t
+#include <cstdint>    // for int32_t
+#include <utility>    // for move
+#include <vector>     // for vector
 
 #include "../../collective/allreduce.h"    // for Allreduce
+#include "../../common/cache_manager.h"    // for CacheManager
 #include "../../common/hist_util.h"        // for GHistRow, ParallelGHi...
 #include "../../common/row_set.h"          // for RowSetCollection
 #include "../../common/threading_utils.h"  // for ParallelFor2d, Range1d, BlockedSpace2d
-#include "../../common/cache_manager.h"    // for CacheManager
 #include "../../data/gradient_index.h"     // for GHistIndexMatrix
 #include "expand_entry.h"                  // for MultiExpandEntry, CPUExpandEntry
 #include "hist_cache.h"                    // for BoundedHistCollection
@@ -74,19 +74,21 @@ class HistogramBuilder {
   void BuildLocalHistograms(common::BlockedSpace2d const &space, GHistIndexMatrix const &gidx,
                             std::vector<bst_node_t> const &nodes_to_build,
                             common::RowSetCollection const &row_set_collection,
-                            common::Span<GradientPair const> gpair_h, bool read_by_column) {
+                            common::Span<GradientPair const> gpair_h, bool read_by_column,
+                            std::size_t tiled_threshold) {
     // Parallel processing by nodes and data in each node
     common::ParallelFor2d(space, this->n_threads_, [&](size_t nid_in_set, common::Range1d r) {
       const auto tid = static_cast<unsigned>(omp_get_thread_num());
       bst_node_t const nidx = nodes_to_build[nid_in_set];
-      auto const& elem = row_set_collection[nidx];
+      auto const &elem = row_set_collection[nidx];
       auto start_of_row_set = std::min(r.begin(), elem.Size());
       auto end_of_row_set = std::min(r.end(), elem.Size());
       auto rid_set = common::Span<bst_idx_t const>{elem.begin() + start_of_row_set,
                                                    elem.begin() + end_of_row_set};
       auto hist = buffer_.GetInitializedHist(tid, nid_in_set);
       if (rid_set.size() != 0) {
-        common::BuildHist<any_missing>(gpair_h, rid_set, gidx, hist, read_by_column);
+        common::BuildHist<any_missing>(gpair_h, rid_set, gidx, hist, read_by_column,
+                                       tiled_threshold);
       }
     });
   }
@@ -150,7 +152,8 @@ class HistogramBuilder {
   void BuildHist(std::size_t page_idx, common::BlockedSpace2d const &space,
                  GHistIndexMatrix const &gidx, common::RowSetCollection const &row_set_collection,
                  std::vector<bst_node_t> const &nodes_to_build,
-                 linalg::VectorView<GradientPair const> gpair, bool read_by_column) {
+                 linalg::VectorView<GradientPair const> gpair, bool read_by_column,
+                 std::size_t tiled_threshold = 0) {
     monitor_.Start(__func__);
     CHECK(gpair.Contiguous());
 
@@ -167,10 +170,10 @@ class HistogramBuilder {
 
     if (gidx.IsDense()) {
       this->BuildLocalHistograms<false>(space, gidx, nodes_to_build, row_set_collection,
-                                        gpair.Values(), read_by_column);
+                                        gpair.Values(), read_by_column, tiled_threshold);
     } else {
       this->BuildLocalHistograms<true>(space, gidx, nodes_to_build, row_set_collection,
-                                       gpair.Values(), read_by_column);
+                                       gpair.Values(), read_by_column, tiled_threshold);
     }
     monitor_.Stop(__func__);
   }
@@ -227,9 +230,8 @@ class HistogramBuilder {
 template <typename Partitioner>
 common::BlockedSpace2d ConstructHistSpace(Partitioner const &partitioners,
                                           std::vector<bst_node_t> const &nodes_to_build,
-                                          const GHistIndexMatrix &gidx,
-                                          std::size_t l1_size, bst_bin_t max_bin,
-                                          bool read_by_column) {
+                                          const GHistIndexMatrix &gidx, std::size_t l1_size,
+                                          bst_bin_t max_bin, bool read_by_column) {
   // FIXME(jiamingy): Handle different size of space.  Right now we use the maximum
   // partition size for the buffer, which might not be efficient if partition sizes
   // has significant variance.
@@ -255,7 +257,7 @@ common::BlockedSpace2d ConstructHistSpace(Partitioner const &partitioners,
 
   std::size_t space_in_l1_for_rows;
   if (read_by_column) {
-   /* In this case, an accurate block_size estimate is performance-critical.
+    /* In this case, an accurate block_size estimate is performance-critical.
     * For column-wise histogram construction, each column is processed over the
     * same block of rows. If the block fits in L1, the row data are loaded once
     * and reused across all columns; otherwise, the cache must be refilled for
@@ -306,10 +308,9 @@ common::BlockedSpace2d ConstructHistSpace(Partitioner const &partitioners,
   constexpr std::size_t kMinBlockSize = kCacheLineSize / sizeof(GradientPair);
   block_size = std::max<std::size_t>(kMinBlockSize, block_size);
 
-  common::BlockedSpace2d space{
-      nodes_to_build.size(), [&](size_t nidx_in_set) {
-                                return partition_size[nidx_in_set];
-                              }, block_size};
+  common::BlockedSpace2d space{nodes_to_build.size(),
+                               [&](size_t nidx_in_set) { return partition_size[nidx_in_set]; },
+                               block_size};
   return space;
 }
 
@@ -328,7 +329,7 @@ class MultiHistogramBuilder {
     size_t hist_size = 2 * sizeof(double) * nbins;
 
     double l3_per_thread = static_cast<double>(cache_manager_.L3Size()) / ctx_->Threads();
-    double usable_cache_size =  0.8 * (cache_manager_.L2Size() + l3_per_thread);
+    double usable_cache_size = 0.8 * (cache_manager_.L2Size() + l3_per_thread);
     const bool hist_fit_to_l2 = usable_cache_size > hist_size;
 
     /* In row-wise histogram construction, each iteration of the outer (row-wise) loop
@@ -342,6 +343,13 @@ class MultiHistogramBuilder {
      */
     bool read_by_column = !hist_fit_to_l2 && gidx.IsDense();
     return read_by_column;
+  }
+
+  /** Compute the histogram size threshold above which the tiled kernel is used.
+   *  Uses the same cache model as ReadByColumn: 0.8 * (L2 + L3/nthreads). */
+  std::size_t TiledThreshold() const {
+    double l3_per_thread = static_cast<double>(cache_manager_.L3Size()) / ctx_->Threads();
+    return static_cast<std::size_t>(0.8 * (cache_manager_.L2Size() + l3_per_thread));
   }
 
  public:
@@ -364,17 +372,18 @@ class MultiHistogramBuilder {
     }
     CHECK(dummy_sub.empty());
 
+    auto const tiled_thresh = TiledThreshold();
     std::size_t page_idx{0};
     for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(ctx_, param)) {
       bool read_by_column = ReadByColumn(gidx, force_read_by_column);
 
-      auto space = ConstructHistSpace(partitioners, nodes, gidx,
-                                      cache_manager_.L1Size(), param.max_bin, read_by_column);
+      auto space = ConstructHistSpace(partitioners, nodes, gidx, cache_manager_.L1Size(),
+                                      param.max_bin, read_by_column);
       for (bst_target_t t{0}; t < n_targets; ++t) {
         auto t_gpair = gpair.Slice(linalg::All(), t);
         this->target_builders_[t].BuildHist(page_idx, space, gidx,
                                             partitioners[page_idx].Partitions(), nodes, t_gpair,
-                                            read_by_column);
+                                            read_by_column, tiled_thresh);
       }
       ++page_idx;
     }
@@ -406,12 +415,13 @@ class MultiHistogramBuilder {
       target_builders_[t].AddHistRows(tree, &nodes_to_build, &nodes_to_sub, false);
     }
 
+    auto const tiled_thresh = TiledThreshold();
     std::size_t page_idx{0};
     for (auto const &page : p_fmat->GetBatches<GHistIndexMatrix>(ctx_, param)) {
       bool read_by_column = ReadByColumn(page, force_read_by_column);
 
-      auto space = ConstructHistSpace(partitioners, nodes_to_build, page,
-                                      cache_manager_.L1Size(), param.max_bin, read_by_column);
+      auto space = ConstructHistSpace(partitioners, nodes_to_build, page, cache_manager_.L1Size(),
+                                      param.max_bin, read_by_column);
 
       auto n_targets = gpair.Shape(1);
       for (bst_target_t t = 0; t < n_targets; ++t) {
@@ -419,7 +429,7 @@ class MultiHistogramBuilder {
         CHECK_EQ(t_gpair.Shape(0), p_fmat->Info().num_row_);
         this->target_builders_[t].BuildHist(page_idx, space, page,
                                             partitioners[page_idx].Partitions(), nodes_to_build,
-                                            t_gpair, read_by_column);
+                                            t_gpair, read_by_column, tiled_thresh);
       }
       page_idx++;
     }
