@@ -2,17 +2,17 @@
  * Copyright 2021-2024, XGBoost contributors
  */
 #include <gtest/gtest.h>
-#include <xgboost/data.h>                       // for BatchIterator, BatchSet, DMatrix, BatchParam
+#include <xgboost/data.h>  // for BatchIterator, BatchSet, DMatrix, BatchParam
 
-#include <algorithm>                            // for sort, unique
-#include <cmath>                                // for isnan
-#include <cstddef>                              // for size_t
-#include <limits>                               // for numeric_limits
-#include <memory>                               // for shared_ptr, __shared_ptr_access, unique_ptr
-#include <string>                               // for string
-#include <tuple>                                // for make_tuple, tie, tuple
-#include <utility>                              // for move
-#include <vector>                               // for vector
+#include <algorithm>  // for sort, unique
+#include <cmath>      // for isnan
+#include <cstddef>    // for size_t
+#include <limits>     // for numeric_limits
+#include <memory>     // for shared_ptr, __shared_ptr_access, unique_ptr
+#include <string>     // for string
+#include <tuple>      // for make_tuple, tie, tuple
+#include <utility>    // for move
+#include <vector>     // for vector
 
 #include "../../../src/common/categorical.h"    // for AsCat
 #include "../../../src/common/column_matrix.h"  // for ColumnMatrix
@@ -234,4 +234,27 @@ INSTANTIATE_TEST_SUITE_P(GHistIndexMatrix, GHistIndexMatrixTest,
                                          std::make_tuple(.6f, .4)));  // dense columns
 
 #endif  // defined(XGBOOST_USE_CUDA)
+
+TEST(GradientIndex, RowsSortedByBinSorted) {
+  // Standard sparse data should have sorted bin indices per row.
+  Context ctx;
+  size_t constexpr kRows = 256, kCols = 16;
+  auto p_fmat = RandomDataGenerator(kRows, kCols, 0.5).Seed(0).GenerateDMatrix();
+  for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(&ctx, BatchParam{64, 0.5})) {
+    if (!gidx.IsDense()) {
+      EXPECT_TRUE(gidx.RowsSortedByBin());
+    }
+  }
+}
+
+TEST(GradientIndex, RowsSortedByBinDense) {
+  // Dense data always reports sorted.
+  Context ctx;
+  size_t constexpr kRows = 256, kCols = 16;
+  auto p_fmat = RandomDataGenerator(kRows, kCols, 0.0).Seed(0).GenerateDMatrix();
+  for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(&ctx, BatchParam{64, 0.5})) {
+    EXPECT_TRUE(gidx.IsDense());
+    EXPECT_TRUE(gidx.RowsSortedByBin());
+  }
+}
 }  // namespace xgboost::data
