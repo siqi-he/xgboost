@@ -368,7 +368,6 @@ void RowsWiseBuildHistKernelTiled(Span<GradientPair const> gpair, Span<bst_idx_t
   using BinIdxType = typename BuildingManager::BinIdxType;
 
   const size_t size = row_indices.size();
-  if (size == 0) return;
   bst_idx_t const *rid = row_indices.data();
   auto const *p_gpair = reinterpret_cast<const float *>(gpair.data());
   const BinIdxType *gradient_index = gmat.index.data<BinIdxType>();
@@ -492,6 +491,10 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
   if (BuildingManager::kReadByColumn) {
     ColsWiseBuildHistKernel<BuildingManager>(gpair, row_indices, gmat, hist);
   } else {
+    if (row_indices.empty()) {
+      return;
+    }
+
     // Large histogram + sufficiently dense data: use tiled kernel.
     // tiled_threshold is computed from cache sizes: 0.8 * (L2 + L3/nthreads).
     // Tiling adds flush overhead per column block. For sparse data where
@@ -515,9 +518,6 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
         (row_indices.begin()[nrows - 1] - row_indices.begin()[0]) == (nrows - 1);
 
     if (contiguousBlock) {
-      if (row_indices.empty()) {
-        return;
-      }
       // contiguous memory access, built-in HW prefetching is enough
       RowsWiseBuildHistKernel<false, BuildingManager>(gpair, row_indices, gmat, hist);
     } else {
