@@ -296,24 +296,59 @@ void ColsWiseBuildHistKernel(Span<GradientPair const> gpair, Span<bst_idx_t cons
                           // 2 FP values: gradient and hessian.
                           // So we need to multiply each row-index/bin-index by 2
                           // to work with gradient pairs as a singe row FP array
-  for (size_t cid = 0; cid < n_columns; ++cid) {
-    const uint32_t offset = kAnyMissing ? 0 : offsets[cid];
+
+  // Column-block tiling with local buffer:
+  // Process kColBlockSize columns at a time, accumulating into a small local
+  // buffer that fits in L1/L2. This amortizes gpair loads across multiple
+  // columns per row visit and localizes histogram writes.
+  auto const &cut_ptrs = gmat.cut.Ptrs();
+  constexpr size_t kColBlockSize = 32;
+
+  // Pre-allocate thread-local buffer sized for the largest column block
+  size_t max_block_bins = 0;
+  for (size_t jj = 0; jj < n_columns; jj += kColBlockSize) {
+    size_t jj_end = std::min(jj + kColBlockSize, n_columns);
+    size_t bins = cut_ptrs[jj_end] - cut_ptrs[jj];
+    max_block_bins = std::max(max_block_bins, bins);
+  }
+
+  static thread_local std::vector<double> tl_cols_buf;
+  tl_cols_buf.resize(max_block_bins * 2);
+
+  for (size_t cid_begin = 0; cid_begin < n_columns; cid_begin += kColBlockSize) {
+    const size_t cid_end = std::min(cid_begin + kColBlockSize, n_columns);
+    const size_t chunk_bin_begin = cut_ptrs[cid_begin];
+    const size_t chunk_bin_end = cut_ptrs[cid_end];
+    const size_t chunk_n_bins = chunk_bin_end - chunk_bin_begin;
+
+    double *local_hist = tl_cols_buf.data();
+    std::fill_n(local_hist, chunk_n_bins * 2, 0.0);
+
     for (size_t i = 0; i < size; ++i) {
       const size_t row_id = rid[i];
       const size_t icol_start = kAnyMissing ? get_row_ptr(row_id) : get_rid(row_id) * n_features;
       const size_t icol_end = kAnyMissing ? get_row_ptr(rid[i] + 1) : icol_start + n_features;
+      const size_t row_size = icol_end - icol_start;
 
-      if (cid < icol_end - icol_start) {
-        const BinIdxType *gr_index_local = gradient_index + icol_start;
-        const uint32_t idx_bin = two * (static_cast<uint32_t>(gr_index_local[cid]) + offset);
-        auto hist_local = hist_data + idx_bin;
+      const size_t idx_gh = two * row_id;
+      const float pgh_t[] = {pgh[idx_gh], pgh[idx_gh + 1]};
+      const BinIdxType *gr_index_local = gradient_index + icol_start;
 
-        const size_t idx_gh = two * row_id;
-        // The trick with pgh_t buffer helps the compiler to generate faster binary.
-        const float pgh_t[] = {pgh[idx_gh], pgh[idx_gh + 1]};
-        *(hist_local) += pgh_t[0];
-        *(hist_local + 1) += pgh_t[1];
+      for (size_t cid = cid_begin; cid < cid_end; ++cid) {
+        if (cid < row_size) {
+          const uint32_t offset = kAnyMissing ? 0 : offsets[cid];
+          const uint32_t global_bin = static_cast<uint32_t>(gr_index_local[cid]) + offset;
+          const uint32_t local_bin = two * (global_bin - static_cast<uint32_t>(chunk_bin_begin));
+          *(local_hist + local_bin) += pgh_t[0];
+          *(local_hist + local_bin + 1) += pgh_t[1];
+        }
       }
+    }
+
+    // Flush local buffer to full histogram
+    double *dst = hist_data + two * chunk_bin_begin;
+    for (size_t j = 0; j < chunk_n_bins * 2; ++j) {
+      dst[j] += local_hist[j];
     }
   }
 }
