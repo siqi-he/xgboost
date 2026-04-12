@@ -651,7 +651,7 @@ class ParallelGHistBuilder {
 template <bool any_missing>
 void BuildHist(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
                const GHistIndexMatrix& gmat, GHistRow hist, bool read_by_column,
-               std::size_t tiled_threshold = 0);
+               bool use_tiled = false);
 }  // namespace common
 }  // namespace xgboost
 #endif  // XGBOOST_COMMON_HIST_UTIL_H_

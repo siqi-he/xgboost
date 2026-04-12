@@ -487,7 +487,7 @@ void RowsWiseBuildHistKernelTiled(Span<GradientPair const> gpair, Span<bst_idx_t
 
 template <class BuildingManager>
 void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                       const GHistIndexMatrix &gmat, GHistRow hist, std::size_t tiled_threshold) {
+                       const GHistIndexMatrix &gmat, GHistRow hist, bool use_tiled) {
   if (BuildingManager::kReadByColumn) {
     ColsWiseBuildHistKernel<BuildingManager>(gpair, row_indices, gmat, hist);
   } else {
@@ -495,15 +495,11 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
       return;
     }
 
-    // Large histogram + sufficiently dense data: use tiled kernel.
-    // tiled_threshold is computed from cache sizes: 0.8 * (L2 + L3/nthreads).
-    // Tiling adds flush overhead per column block. For sparse data where
-    // few bins are hit per row, the flush cost dominates. Gate on density
-    // to avoid regression on highly sparse datasets.
-    const size_t hist_bytes = gmat.cut.Ptrs().back() * 2 * sizeof(double);
-    if (tiled_threshold > 0 && hist_bytes > tiled_threshold) {
+    // Tiled kernel: column-block tiling with local buffer for cache locality.
+    // Gated on density (flush overhead on sparse data) and sorted bin indices
+    // (required for cursor-based sparse traversal).
+    if (use_tiled) {
       constexpr double kMinDensityForTiling = 0.5;
-      // Sparse tiled path requires sorted bin indices for cursor traversal.
       bool bin_sorted = !BuildingManager::kAnyMissing || gmat.RowsSortedByBin();
       if (gmat.Density() > kMinDensityForTiling && bin_sorted) {
         RowsWiseBuildHistKernelTiled<BuildingManager>(gpair, row_indices, gmat, hist);
@@ -536,23 +532,22 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
 
 template <bool any_missing>
 void BuildHist(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
-               std::size_t tiled_threshold) {
+               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column, bool use_tiled) {
   bool first_page = gmat.base_rowid == 0;
   auto bin_type_size = gmat.index.GetBinTypeSize();
 
   GHistBuildingManager<any_missing>::DispatchAndExecute(
       {first_page, read_by_column, bin_type_size}, [&](auto t) {
         using BuildingManager = decltype(t);
-        BuildHistDispatch<BuildingManager>(gpair, row_indices, gmat, hist, tiled_threshold);
+        BuildHistDispatch<BuildingManager>(gpair, row_indices, gmat, hist, use_tiled);
       });
 }
 
 template void BuildHist<true>(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
                               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
-                              std::size_t tiled_threshold);
+                              bool use_tiled);
 
 template void BuildHist<false>(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
                                const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
-                               std::size_t tiled_threshold);
+                               bool use_tiled);
 }  // namespace xgboost::common
