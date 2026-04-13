@@ -487,7 +487,7 @@ void RowsWiseBuildHistKernelTiled(Span<GradientPair const> gpair, Span<bst_idx_t
 
 template <class BuildingManager>
 void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                       const GHistIndexMatrix &gmat, GHistRow hist, bool use_tiled) {
+                       const GHistIndexMatrix &gmat, GHistRow hist, bool wide_hist) {
   if (BuildingManager::kReadByColumn) {
     ColsWiseBuildHistKernel<BuildingManager>(gpair, row_indices, gmat, hist);
   } else {
@@ -498,7 +498,7 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
     // Tiled kernel: column-block tiling with local buffer for cache locality.
     // Gated on density (flush overhead on sparse data) and sorted bin indices
     // (required for cursor-based sparse traversal).
-    if (use_tiled) {
+    if (wide_hist) {
       constexpr double kMinDensityForTiling = 0.5;
       bool bin_sorted = !BuildingManager::kAnyMissing || gmat.RowsSortedByBin();
       if (gmat.Density() > kMinDensityForTiling && bin_sorted) {
@@ -532,22 +532,22 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
 
 template <bool any_missing>
 void BuildHist(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column, bool use_tiled) {
+               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column, bool wide_hist) {
   bool first_page = gmat.base_rowid == 0;
   auto bin_type_size = gmat.index.GetBinTypeSize();
 
   GHistBuildingManager<any_missing>::DispatchAndExecute(
       {first_page, read_by_column, bin_type_size}, [&](auto t) {
         using BuildingManager = decltype(t);
-        BuildHistDispatch<BuildingManager>(gpair, row_indices, gmat, hist, use_tiled);
+        BuildHistDispatch<BuildingManager>(gpair, row_indices, gmat, hist, wide_hist);
       });
 }
 
 template void BuildHist<true>(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
                               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
-                              bool use_tiled);
+                              bool wide_hist);
 
 template void BuildHist<false>(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
                                const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
-                               bool use_tiled);
+                               bool wide_hist);
 }  // namespace xgboost::common

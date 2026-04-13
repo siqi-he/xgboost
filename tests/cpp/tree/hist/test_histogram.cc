@@ -665,18 +665,18 @@ TEST(CPUHistogram, SparseWithTiledKernel) {
   for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(&ctx, {kMaxBins, 0.5})) {
     hist_tiled.BuildHist(0, space, gidx, row_set, nodes,
                          linalg::MakeTensorView(&ctx, gpair, gpair.size()), false,
-                         /*use_tiled=*/true);
+                         /*wide_hist=*/true);
   }
   hist_tiled.SyncHistogram(&ctx, tree.HostScView(), nodes, {});
 
-  // Build reference histogram with original kernel (use_tiled=false)
+  // Build reference histogram with original kernel (wide_hist=false)
   HistogramBuilder hist_ref;
   hist_ref.Reset(&ctx, total_bins, {kMaxBins, 0.5}, false, false, &hist_param);
   hist_ref.AddHistRows(tree.HostScView(), &nodes, &dummy_sub, false);
   for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(&ctx, {kMaxBins, 0.5})) {
     hist_ref.BuildHist(0, space, gidx, row_set, nodes,
                        linalg::MakeTensorView(&ctx, gpair, gpair.size()), false,
-                       /*use_tiled=*/false);
+                       /*wide_hist=*/false);
   }
   hist_ref.SyncHistogram(&ctx, tree.HostScView(), nodes, {});
 
