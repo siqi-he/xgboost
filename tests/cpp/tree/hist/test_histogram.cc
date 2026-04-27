@@ -619,5 +619,4 @@ auto MakeParamsForTest() {
 TEST_P(OverflowTest, Overflow) { this->RunTest(); }
 
 INSTANTIATE_TEST_SUITE_P(CPUHistogram, OverflowTest, ::testing::ValuesIn(MakeParamsForTest()));
-
 }  // namespace xgboost::tree
