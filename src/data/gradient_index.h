@@ -137,13 +137,6 @@ class GHistIndexMatrix {
       // no compression
       SetIndexData(index_data_span, rbegin, ft, batch_threads, batch, is_valid, n_bins_total,
                    [](auto idx, auto) { return idx; });
-      // Enforce global bin indices are sorted per row.
-      // This is required to construct histogram efficiently.
-      common::ParallelFor(batch.Size(), batch_threads, [&](size_t i) {
-        auto begin = index_data_span.data() + row_ptr[rbegin + i];
-        auto end = index_data_span.data() + row_ptr[rbegin + i + 1];
-        std::sort(begin, end);
-      });
     }
     this->GatherHitCount(n_threads, n_bins_total);
   }
