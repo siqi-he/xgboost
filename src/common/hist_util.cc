@@ -10,6 +10,7 @@
 
 #include "../data/adapter.h"         // for SparsePageAdapterBatch
 #include "../data/gradient_index.h"  // for GHistIndexMatrix
+#include "cache_manager.h"           // for CacheManager
 #include "io.h"                      // for AlignedResourceReadStream, AlignedFileWriteStream
 #include "quantile.h"
 #include "xgboost/base.h"
@@ -195,18 +196,32 @@ class GHistBuildingManager {
   }
 };
 
-// Column-block tiled scatter for wide-sparse data. Returns true if the tile
-// path handled this call. Per-row cursors walk each row's sorted global bin
-// indices across column blocks; total work = one pass per row.
-// Invariant: `GHistIndexMatrix` construction guarantees bin indices are sorted
-// within each row.
+// Build the sparse histogram one column block at a time, accumulating into a
+// thread-local buffer that fits in cache. Returns false (fall through to the
+// direct-scatter loop) when the histogram fits in cache or per-leaf scatter
+// work does not amortize the per-block overhead.
 template <class BuildingManager>
-bool TryTiledSparseHist(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                        const GHistIndexMatrix &gmat, GHistRow hist) {
+bool BuildSparseHistByBlocks(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
+                             const GHistIndexMatrix &gmat, GHistRow hist) {
   constexpr bool kFirstPage = BuildingManager::kFirstPage;
   using BinIdxType = typename BuildingManager::BinIdxType;
 
   constexpr size_t kColBlockSize = 32;
+
+  auto const &cut_ptrs = gmat.cut.Ptrs();
+  const size_t n_features = cut_ptrs.size() - 1;
+  const size_t total_hist_bins = cut_ptrs.back();
+
+  // Check 1: histogram size vs. per-thread cache budget. Detected once per
+  // process via CacheManager (CPUID + sane defaults).
+  static const CacheManager kCacheManager{};
+  const size_t hist_bytes = 2 * sizeof(double) * total_hist_bins;
+  const double l3_per_thread =
+      static_cast<double>(kCacheManager.L3Size()) / std::max(1, omp_get_max_threads());
+  const double usable_cache = 0.8 * (kCacheManager.L2Size() + l3_per_thread);
+  if (static_cast<double>(hist_bytes) <= usable_cache) {
+    return false;
+  }
 
   const size_t size = row_indices.size();
   bst_idx_t const *rid = row_indices.data();
@@ -216,35 +231,29 @@ bool TryTiledSparseHist(Span<GradientPair const> gpair, Span<bst_idx_t const> ro
     return kFirstPage ? row_ptr[ridx] : row_ptr[ridx - base_rowid];
   };
 
-  // Gate: scatter work must amortize the tiled path's fixed per-block cost
-  // (O(block_n_bins) clear + flush plus O(n_rows) row iteration per block).
+  // Check 2: per-node nnz must amortize the tile path's fixed per-block cost.
   size_t nnz = 0;
   for (size_t i = 0; i < size; ++i) {
     nnz += get_row_ptr(rid[i] + 1) - get_row_ptr(rid[i]);
   }
-  auto const &cut_ptrs = gmat.cut.Ptrs();
-  const size_t n_features = cut_ptrs.size() - 1;
   const size_t n_blocks = (n_features + kColBlockSize - 1) / kColBlockSize;
-  const size_t total_hist_bins = cut_ptrs.back();
   const size_t tile_overhead = size * n_blocks + total_hist_bins;
   if (nnz <= 2 * tile_overhead) {
     return false;
   }
 
-  const auto uint32_t_max_block_bins = [&] {
-    size_t m = 0;
-    for (size_t jj = 0; jj < n_features; jj += kColBlockSize) {
-      size_t jj_end = std::min(jj + kColBlockSize, n_features);
-      m = std::max(m, static_cast<size_t>(cut_ptrs[jj_end] - cut_ptrs[jj]));
-    }
-    return m;
-  }();
+  size_t max_block_bins = 0;
+  for (size_t jj = 0; jj < n_features; jj += kColBlockSize) {
+    size_t jj_end = std::min(jj + kColBlockSize, n_features);
+    size_t bins = cut_ptrs[jj_end] - cut_ptrs[jj];
+    max_block_bins = std::max(max_block_bins, bins);
+  }
 
   static thread_local std::vector<double> tl_buf;
   static thread_local std::vector<size_t> tl_row_starts;
   static thread_local std::vector<size_t> tl_row_sizes;
   static thread_local std::vector<uint32_t> tl_cursors;
-  tl_buf.resize(uint32_t_max_block_bins * 2);
+  tl_buf.resize(max_block_bins * 2);
   tl_row_starts.resize(size);
   tl_row_sizes.resize(size);
   tl_cursors.assign(size, 0);
@@ -294,18 +303,15 @@ bool TryTiledSparseHist(Span<GradientPair const> gpair, Span<bst_idx_t const> ro
   return true;
 }
 
-// Row-wise histogram builder. With wide_hist=true, tries a column-block tiled
-// path with a thread-local buffer via TryTiledSparseHist (kAnyMissing only);
-// otherwise falls through to the direct-scatter loop below.
 template <bool do_prefetch, class BuildingManager>
 void RowsWiseBuildHistKernel(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                             const GHistIndexMatrix &gmat, GHistRow hist, bool wide_hist = false) {
+                             const GHistIndexMatrix &gmat, GHistRow hist) {
   constexpr bool kAnyMissing = BuildingManager::kAnyMissing;
   constexpr bool kFirstPage = BuildingManager::kFirstPage;
   using BinIdxType = typename BuildingManager::BinIdxType;
 
   if constexpr (kAnyMissing) {
-    if (wide_hist && TryTiledSparseHist<BuildingManager>(gpair, row_indices, gmat, hist)) {
+    if (BuildSparseHistByBlocks<BuildingManager>(gpair, row_indices, gmat, hist)) {
       return;
     }
   }
@@ -463,7 +469,7 @@ void ColsWiseBuildHistKernel(Span<GradientPair const> gpair, Span<bst_idx_t cons
 
 template <class BuildingManager>
 void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                       const GHistIndexMatrix &gmat, GHistRow hist, bool wide_hist) {
+                       const GHistIndexMatrix &gmat, GHistRow hist) {
   if (BuildingManager::kReadByColumn) {
     ColsWiseBuildHistKernel<BuildingManager>(gpair, row_indices, gmat, hist);
   } else {
@@ -479,16 +485,16 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
 
     if (contiguousBlock) {
       // contiguous memory access, built-in HW prefetching is enough
-      RowsWiseBuildHistKernel<false, BuildingManager>(gpair, row_indices, gmat, hist, wide_hist);
+      RowsWiseBuildHistKernel<false, BuildingManager>(gpair, row_indices, gmat, hist);
     } else {
       auto span1 = row_indices.subspan(0, row_indices.size() - no_prefetch_size);
       if (!span1.empty()) {
-        RowsWiseBuildHistKernel<true, BuildingManager>(gpair, span1, gmat, hist, wide_hist);
+        RowsWiseBuildHistKernel<true, BuildingManager>(gpair, span1, gmat, hist);
       }
       // no prefetching to avoid loading extra memory
       auto span2 = row_indices.subspan(row_indices.size() - no_prefetch_size);
       if (!span2.empty()) {
-        RowsWiseBuildHistKernel<false, BuildingManager>(gpair, span2, gmat, hist, wide_hist);
+        RowsWiseBuildHistKernel<false, BuildingManager>(gpair, span2, gmat, hist);
       }
     }
   }
@@ -496,22 +502,20 @@ void BuildHistDispatch(Span<GradientPair const> gpair, Span<bst_idx_t const> row
 
 template <bool any_missing>
 void BuildHist(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column, bool wide_hist) {
+               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column) {
   bool first_page = gmat.base_rowid == 0;
   auto bin_type_size = gmat.index.GetBinTypeSize();
 
   GHistBuildingManager<any_missing>::DispatchAndExecute(
       {first_page, read_by_column, bin_type_size}, [&](auto t) {
         using BuildingManager = decltype(t);
-        BuildHistDispatch<BuildingManager>(gpair, row_indices, gmat, hist, wide_hist);
+        BuildHistDispatch<BuildingManager>(gpair, row_indices, gmat, hist);
       });
 }
 
 template void BuildHist<true>(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                              const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
-                              bool wide_hist);
+                              const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column);
 
 template void BuildHist<false>(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
-                               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column,
-                               bool wide_hist);
+                               const GHistIndexMatrix &gmat, GHistRow hist, bool read_by_column);
 }  // namespace xgboost::common
