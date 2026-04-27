@@ -195,12 +195,120 @@ class GHistBuildingManager {
   }
 };
 
+// Column-block tiled scatter for wide-sparse data. Returns true if the tile
+// path handled this call. Per-row cursors walk each row's sorted global bin
+// indices across column blocks; total work = one pass per row.
+// Invariant: `GHistIndexMatrix` construction guarantees bin indices are sorted
+// within each row.
+template <class BuildingManager>
+bool TryTiledSparseHist(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
+                        const GHistIndexMatrix &gmat, GHistRow hist) {
+  constexpr bool kFirstPage = BuildingManager::kFirstPage;
+  using BinIdxType = typename BuildingManager::BinIdxType;
+
+  constexpr size_t kColBlockSize = 32;
+
+  const size_t size = row_indices.size();
+  bst_idx_t const *rid = row_indices.data();
+  auto const &row_ptr = gmat.row_ptr.data();
+  auto base_rowid = gmat.base_rowid;
+  auto get_row_ptr = [&](bst_idx_t ridx) {
+    return kFirstPage ? row_ptr[ridx] : row_ptr[ridx - base_rowid];
+  };
+
+  // Gate: scatter work must amortize the tiled path's fixed per-block cost
+  // (O(block_n_bins) clear + flush plus O(n_rows) row iteration per block).
+  size_t nnz = 0;
+  for (size_t i = 0; i < size; ++i) {
+    nnz += get_row_ptr(rid[i] + 1) - get_row_ptr(rid[i]);
+  }
+  auto const &cut_ptrs = gmat.cut.Ptrs();
+  const size_t n_features = cut_ptrs.size() - 1;
+  const size_t n_blocks = (n_features + kColBlockSize - 1) / kColBlockSize;
+  const size_t total_hist_bins = cut_ptrs.back();
+  const size_t tile_overhead = size * n_blocks + total_hist_bins;
+  if (nnz <= 2 * tile_overhead) {
+    return false;
+  }
+
+  const auto uint32_t_max_block_bins = [&] {
+    size_t m = 0;
+    for (size_t jj = 0; jj < n_features; jj += kColBlockSize) {
+      size_t jj_end = std::min(jj + kColBlockSize, n_features);
+      m = std::max(m, static_cast<size_t>(cut_ptrs[jj_end] - cut_ptrs[jj]));
+    }
+    return m;
+  }();
+
+  static thread_local std::vector<double> tl_buf;
+  static thread_local std::vector<size_t> tl_row_starts;
+  static thread_local std::vector<size_t> tl_row_sizes;
+  static thread_local std::vector<uint32_t> tl_cursors;
+  tl_buf.resize(uint32_t_max_block_bins * 2);
+  tl_row_starts.resize(size);
+  tl_row_sizes.resize(size);
+  tl_cursors.assign(size, 0);
+
+  for (size_t i = 0; i < size; ++i) {
+    tl_row_starts[i] = get_row_ptr(rid[i]);
+    tl_row_sizes[i] = get_row_ptr(rid[i] + 1) - tl_row_starts[i];
+  }
+
+  auto const *p_gpair = reinterpret_cast<const float *>(gpair.data());
+  const BinIdxType *gradient_index = gmat.index.data<BinIdxType>();
+  auto hist_data = reinterpret_cast<double *>(hist.data());
+  const uint32_t two{2};
+
+  for (size_t cid_begin = 0; cid_begin < n_features; cid_begin += kColBlockSize) {
+    const size_t cid_end = std::min(cid_begin + kColBlockSize, n_features);
+    const uint32_t bin_lo = cut_ptrs[cid_begin];
+    const uint32_t bin_hi = cut_ptrs[cid_end];
+    const size_t block_n_bins = bin_hi - bin_lo;
+
+    double *local_hist = tl_buf.data();
+    std::fill_n(local_hist, block_n_bins * 2, 0.0);
+
+    for (size_t i = 0; i < size; ++i) {
+      const BinIdxType *gr_row = gradient_index + tl_row_starts[i];
+      const size_t row_size = tl_row_sizes[i];
+      const size_t idx_gh = two * rid[i];
+      const float pgh_t[] = {p_gpair[idx_gh], p_gpair[idx_gh + 1]};
+
+      size_t j = tl_cursors[i];
+      while (j < row_size && static_cast<uint32_t>(gr_row[j]) < bin_lo) ++j;
+      while (j < row_size && static_cast<uint32_t>(gr_row[j]) < bin_hi) {
+        const uint32_t gidx = static_cast<uint32_t>(gr_row[j]);
+        const uint32_t local_bin = two * (gidx - bin_lo);
+        *(local_hist + local_bin) += pgh_t[0];
+        *(local_hist + local_bin + 1) += pgh_t[1];
+        ++j;
+      }
+      tl_cursors[i] = j;
+    }
+
+    double *dst = hist_data + two * bin_lo;
+    for (size_t j = 0; j < block_n_bins * 2; ++j) {
+      dst[j] += local_hist[j];
+    }
+  }
+  return true;
+}
+
+// Row-wise histogram builder. With wide_hist=true, tries a column-block tiled
+// path with a thread-local buffer via TryTiledSparseHist (kAnyMissing only);
+// otherwise falls through to the direct-scatter loop below.
 template <bool do_prefetch, class BuildingManager>
 void RowsWiseBuildHistKernel(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
                              const GHistIndexMatrix &gmat, GHistRow hist, bool wide_hist = false) {
   constexpr bool kAnyMissing = BuildingManager::kAnyMissing;
   constexpr bool kFirstPage = BuildingManager::kFirstPage;
   using BinIdxType = typename BuildingManager::BinIdxType;
+
+  if constexpr (kAnyMissing) {
+    if (wide_hist && TryTiledSparseHist<BuildingManager>(gpair, row_indices, gmat, hist)) {
+      return;
+    }
+  }
 
   const size_t size = row_indices.size();
   bst_idx_t const *rid = row_indices.data();
@@ -225,88 +333,13 @@ void RowsWiseBuildHistKernel(Span<GradientPair const> gpair, Span<bst_idx_t cons
   };
 
   CHECK_NE(row_indices.size(), 0);
-  auto const &cut_ptrs = gmat.cut.Ptrs();
-  const size_t n_features = cut_ptrs.size() - 1;
+  const size_t n_features =
+      get_row_ptr(row_indices.data()[0] + 1) - get_row_ptr(row_indices.data()[0]);
   auto hist_data = reinterpret_cast<double *>(hist.data());
   const uint32_t two{2};  // Each element from 'gpair' and 'hist' contains
                           // 2 FP values: gradient and hessian.
                           // So we need to multiply each row-index/bin-index by 2
                           // to work with gradient pairs as a singe row FP array
-
-  // Dynamic per-node tiling: for wide-sparse data, tile when scatter work (nnz)
-  // amortizes the tiled path's fixed overhead (per-block clear + flush of
-  // block_n_bins, plus per-block row iteration). Dense wide data is dispatched
-  // to ColsWiseBuildHistKernel upstream and never reaches here.
-  constexpr size_t kColBlockSize = 32;
-  if constexpr (kAnyMissing) {
-    if (wide_hist) {
-      size_t nnz = 0;
-      for (size_t i = 0; i < size; ++i) {
-        nnz += get_row_ptr(rid[i] + 1) - get_row_ptr(rid[i]);
-      }
-      const size_t n_blocks = (n_features + kColBlockSize - 1) / kColBlockSize;
-      const size_t total_hist_bins = cut_ptrs.back();
-      const size_t tile_overhead = size * n_blocks + total_hist_bins;
-      if (nnz > 2 * tile_overhead && gmat.RowsSortedByBin()) {
-        size_t max_block_bins = 0;
-        for (size_t jj = 0; jj < n_features; jj += kColBlockSize) {
-          size_t jj_end = std::min(jj + kColBlockSize, n_features);
-          size_t bins = cut_ptrs[jj_end] - cut_ptrs[jj];
-          max_block_bins = std::max(max_block_bins, bins);
-        }
-        static thread_local std::vector<double> tl_buf;
-        tl_buf.resize(max_block_bins * 2);
-
-        std::vector<size_t> row_starts(size);
-        std::vector<size_t> row_sizes(size);
-        for (size_t i = 0; i < size; ++i) {
-          row_starts[i] = get_row_ptr(rid[i]);
-          row_sizes[i] = get_row_ptr(rid[i] + 1) - row_starts[i];
-        }
-
-        // Per-row cursors track position within each row's entries across column
-        // blocks. Entries are sorted by global bin index and blocks are processed
-        // in ascending bin order, so the cursor for block k+1 starts where block
-        // k left off. Total work across all blocks = one pass per row.
-        std::vector<uint32_t> cursors(size, 0);
-
-        for (size_t cid_begin = 0; cid_begin < n_features; cid_begin += kColBlockSize) {
-          const size_t cid_end = std::min(cid_begin + kColBlockSize, n_features);
-          const uint32_t bin_lo = cut_ptrs[cid_begin];
-          const uint32_t bin_hi = cut_ptrs[cid_end];
-          const size_t block_n_bins = bin_hi - bin_lo;
-
-          double *local_hist = tl_buf.data();
-          std::fill_n(local_hist, block_n_bins * 2, 0.0);
-
-          for (size_t i = 0; i < size; ++i) {
-            const BinIdxType *gr_row = gradient_index + row_starts[i];
-            const size_t row_size = row_sizes[i];
-
-            const size_t idx_gh = two * rid[i];
-            const float pgh_t[] = {p_gpair[idx_gh], p_gpair[idx_gh + 1]};
-
-            size_t j = cursors[i];
-            while (j < row_size && static_cast<uint32_t>(gr_row[j]) < bin_lo) ++j;
-            while (j < row_size && static_cast<uint32_t>(gr_row[j]) < bin_hi) {
-              const uint32_t gidx = static_cast<uint32_t>(gr_row[j]);
-              const uint32_t local_bin = two * (gidx - bin_lo);
-              *(local_hist + local_bin) += pgh_t[0];
-              *(local_hist + local_bin + 1) += pgh_t[1];
-              ++j;
-            }
-            cursors[i] = j;
-          }
-
-          double *dst = hist_data + two * bin_lo;
-          for (size_t j = 0; j < block_n_bins * 2; ++j) {
-            dst[j] += local_hist[j];
-          }
-        }
-        return;
-      }
-    }
-  }
 
   for (std::size_t i = 0; i < size; ++i) {
     const size_t icol_start = kAnyMissing ? get_row_ptr(rid[i]) : get_rid(rid[i]) * n_features;

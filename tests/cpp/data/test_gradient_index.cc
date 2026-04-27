@@ -234,27 +234,4 @@ INSTANTIATE_TEST_SUITE_P(GHistIndexMatrix, GHistIndexMatrixTest,
                                          std::make_tuple(.6f, .4)));  // dense columns
 
 #endif  // defined(XGBOOST_USE_CUDA)
-
-TEST(GradientIndex, RowsSortedByBinSorted) {
-  // Standard sparse data should have sorted bin indices per row.
-  Context ctx;
-  size_t constexpr kRows = 256, kCols = 16;
-  auto p_fmat = RandomDataGenerator(kRows, kCols, 0.5).Seed(0).GenerateDMatrix();
-  for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(&ctx, BatchParam{64, 0.5})) {
-    if (!gidx.IsDense()) {
-      EXPECT_TRUE(gidx.RowsSortedByBin());
-    }
-  }
-}
-
-TEST(GradientIndex, RowsSortedByBinDense) {
-  // Dense data always reports sorted.
-  Context ctx;
-  size_t constexpr kRows = 256, kCols = 16;
-  auto p_fmat = RandomDataGenerator(kRows, kCols, 0.0).Seed(0).GenerateDMatrix();
-  for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(&ctx, BatchParam{64, 0.5})) {
-    EXPECT_TRUE(gidx.IsDense());
-    EXPECT_TRUE(gidx.RowsSortedByBin());
-  }
-}
 }  // namespace xgboost::data

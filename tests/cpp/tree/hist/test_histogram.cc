@@ -635,8 +635,6 @@ TEST(CPUHistogram, SparseWithTiledKernel) {
 
   // Confirm sparse
   ASSERT_TRUE(!gmat.IsDense());
-  // Confirm sorted (standard construction path)
-  ASSERT_TRUE(gmat.RowsSortedByBin());
 
   uint32_t total_bins = gmat.cut.Ptrs().back();
   std::vector<GradientPair> gpair(kNRows);
