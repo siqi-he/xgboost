@@ -249,14 +249,10 @@ bool BuildSparseHistByBlocks(Span<GradientPair const> gpair, Span<bst_idx_t cons
     max_block_bins = std::max(max_block_bins, bins);
   }
 
-  static thread_local std::vector<double> tl_buf;
-  static thread_local std::vector<size_t> tl_row_starts;
-  static thread_local std::vector<size_t> tl_row_sizes;
-  static thread_local std::vector<uint32_t> tl_cursors;
-  tl_buf.resize(max_block_bins * 2);
-  tl_row_starts.resize(size);
-  tl_row_sizes.resize(size);
-  tl_cursors.assign(size, 0);
+  std::vector<double> tl_buf(max_block_bins * 2);
+  std::vector<size_t> tl_row_starts(size);
+  std::vector<size_t> tl_row_sizes(size);
+  std::vector<uint32_t> tl_cursors(size, 0);
 
   for (size_t i = 0; i < size; ++i) {
     tl_row_starts[i] = get_row_ptr(rid[i]);
@@ -426,8 +422,7 @@ void ColsWiseBuildHistKernel(Span<GradientPair const> gpair, Span<bst_idx_t cons
     max_block_bins = std::max(max_block_bins, bins);
   }
 
-  static thread_local std::vector<double> tl_cols_buf;
-  tl_cols_buf.resize(max_block_bins * 2);
+  std::vector<double> tl_cols_buf(max_block_bins * 2);
 
   for (size_t cid_begin = 0; cid_begin < n_columns; cid_begin += kColBlockSize) {
     const size_t cid_end = std::min(cid_begin + kColBlockSize, n_columns);
