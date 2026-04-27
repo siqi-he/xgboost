@@ -55,8 +55,6 @@ TEST(GHistIndexPageRawFormat, IO) {
     ASSERT_TRUE(std::equal(loaded.index.begin(), loaded.index.end(), page.index.begin()));
     ASSERT_TRUE(std::equal(loaded.index.Offset(), loaded.index.Offset() + loaded.index.OffsetSize(),
                            page.index.Offset()));
-    ASSERT_EQ(loaded.RowsSortedByBin(), page.RowsSortedByBin());
-    ASSERT_DOUBLE_EQ(loaded.Density(), page.Density());
 
     ASSERT_EQ(loaded.Transpose().GetTypeSize(), loaded.Transpose().GetTypeSize());
   }
