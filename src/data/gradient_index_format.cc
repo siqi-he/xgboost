@@ -75,9 +75,6 @@ namespace xgboost::data {
     page->SetRowsSortedByBin(false);
   }
 
-  // Density is not persisted — recompute from row_ptr and cut. O(1).
-  page->RecomputeDensity();
-
   return true;
 }
 

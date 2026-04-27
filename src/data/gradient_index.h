@@ -155,16 +155,6 @@ class GHistIndexMatrix {
       rows_sorted_by_bin_ = rows_sorted_by_bin_ && sorted.load();
     }
 
-    // Compute density: nnz / (n_rows * n_features). For dense data, density_ stays 1.0.
-    if (!isDense_) {
-      auto n_rows = row_ptr.size() - 1;
-      auto n_features = cut.Ptrs().size() - 1;
-      if (n_rows > 0 && n_features > 0) {
-        density_ = static_cast<double>(row_ptr[n_rows]) /
-                   (static_cast<double>(n_rows) * static_cast<double>(n_features));
-      }
-    }
-
     this->GatherHitCount(n_threads, n_bins_total);
   }
 
@@ -282,26 +272,6 @@ class GHistIndexMatrix {
   [[nodiscard]] bool RowsSortedByBin() const { return isDense_ || rows_sorted_by_bin_; }
   void SetRowsSortedByBin(bool v) { rows_sorted_by_bin_ = v; }
 
-  /** @brief Fraction of non-missing entries. 1.0 for dense data.
-   *  Computed during index construction; recomputed on cache read. */
-  [[nodiscard]] double Density() const { return density_; }
-
-  /** @brief Recompute density from row_ptr and cut. O(1).
-   *  Called after reading from cache since density is not persisted. */
-  void RecomputeDensity() {
-    if (isDense_) {
-      density_ = 1.0;
-      return;
-    }
-    auto n_rows = row_ptr.size() - 1;
-    auto n_features = cut.Ptrs().size() - 1;
-    if (n_rows > 0 && n_features > 0) {
-      density_ = static_cast<double>(row_ptr[n_rows]) /
-                 (static_cast<double>(n_rows) * static_cast<double>(n_features));
-    } else {
-      density_ = 1.0;
-    }
-  }
   [[nodiscard]] bst_idx_t BaseRowId() const { return base_rowid; }
   /**
    * @brief Get the local row index from the global row index.
@@ -347,7 +317,6 @@ class GHistIndexMatrix {
   std::vector<size_t> hit_count_tloc_;
   bool isDense_;
   bool rows_sorted_by_bin_{true};
-  double density_{1.0};
 };
 
 /**
