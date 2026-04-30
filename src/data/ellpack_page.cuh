@@ -1,5 +1,5 @@
 /**
- * Copyright 2019-2025, XGBoost Contributors
+ * Copyright 2019-2026, XGBoost Contributors
  */
 #ifndef XGBOOST_DATA_ELLPACK_PAGE_CUH_
 #define XGBOOST_DATA_ELLPACK_PAGE_CUH_
@@ -112,7 +112,7 @@ struct EllpackAccessorImpl {
       return gidx;
     }
     bst_bin_t gidx = gidx_iter[row_begin + fidx];
-    if (gidx == this->NullValue()) {
+    if (gidx == static_cast<bst_bin_t>(this->NullValue())) {
       // Missing value in a dense ellpack
       return -1;
     }
@@ -138,7 +138,7 @@ struct EllpackAccessorImpl {
       gidx = it - gidx_fvalue_map.cbegin();
     }
 
-    if (gidx == end) {
+    if (gidx == static_cast<bst_bin_t>(end)) {
       gidx -= 1;
     }
     return gidx;
@@ -186,7 +186,7 @@ class EllpackPageImpl {
    * This is used in the external memory case. An empty ELLPACK page is constructed with its content
    * set later by the reader.
    */
-  EllpackPageImpl() = default;
+  EllpackPageImpl();
 
   /**
    * @brief Constructor from existing ellpack matrics.

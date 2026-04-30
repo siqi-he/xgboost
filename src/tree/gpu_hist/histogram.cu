@@ -170,7 +170,7 @@ __device__ void HistKernelOneNodeTarget(Accessor const& matrix, FeatureGroup con
     auto fidx = fidx_in_set + group.start_feature;
 
     bst_bin_t compressed_bin = matrix.gidx_iter[IterIdx(matrix, ridx, fidx)];
-    if (Policy::kDense || compressed_bin != matrix.NullValue()) {
+    if (Policy::kDense || compressed_bin != static_cast<bst_bin_t>(matrix.NullValue())) {
       auto g = LoadGpair(gpair + ridx);
       if constexpr (Policy::kCompressed) {
         compressed_bin += matrix.feature_segments[fidx];
@@ -227,7 +227,7 @@ __global__ __launch_bounds__(StHistBound::kBlockThreads, StHistBound::kMinBlocks
     Accessor const matrix, FeatureGroupsAccessor const feature_groups,
     common::Span<cuda_impl::RowIndexT const> d_ridx_iter,
     common::Span<GradientPairInt64 const> d_gpair, common::Span<GradientPairInt64> node_hist) {
-  extern __align__(cuda::std::alignment_of_v<GradientPairInt64>) __shared__ char shmem[];
+  extern __align__(std::alignment_of_v<GradientPairInt64>) __shared__ char shmem[];
 
   // Privatized histogram
   auto smem_hist = reinterpret_cast<GradientPairInt64*>(shmem);
@@ -263,7 +263,7 @@ __global__ __launch_bounds__(MtHistBound::kBlockThreads, MtHistBound::kMinBlocks
   Idx nidx_in_set = dh::SegmentId(p_blk_ptr, p_blk_ptr + blk_ptr.size(), blockIdx.x);
   Idx starting_blk = p_blk_ptr[nidx_in_set];
 
-  extern __align__(cuda::std::alignment_of_v<GradientPairInt64>) __shared__ char shmem[];
+  extern __align__(std::alignment_of_v<GradientPairInt64>) __shared__ char shmem[];
 
   // Privatized histogram
   auto smem_hist = reinterpret_cast<GradientPairInt64*>(shmem);
@@ -523,7 +523,6 @@ class DeviceHistogramDispatchAccessor {
       this->kernel_->Dispatch(ctx, matrix, feature_groups, gpair, ridx_iters.data().get(), hists,
                               h_sizes_csum);
     } else {
-      using RidxIter = cuda_impl::RowIndexT const;
       this->kernel_->Dispatch(ctx, matrix, feature_groups, gpair, ridxs.data(), hists,
                               h_sizes_csum);
     }
